@@ -13,10 +13,14 @@
 #   --source-schema NAME     Schema origen (default: SCHEMA del .env)
 #   --dest-schema NAME       Schema destino (default: igual al origen)
 #   --only a,b,c             Sincronizar solo estas tablas
+#   --tables-file PATH       Archivo con una tabla por linea (default: tables.txt)
+#   --all                    Migrar todas las tablas del schema
 #   --exclude a,b,c          Excluir estas tablas
 #   --full                   Recargar por completo las tablas seleccionadas
 #   --prune                  Borrar en local las filas que ya no existen en origen
+#   --schema-only            Crear estructura sin copiar datos
 #   --overlap-seconds N      Margen de solapamiento para cambios (default: 300)
+#   --source-data-timezone   Zona horaria con la que la app guarda los timestamps
 #   --no-analyze             No ejecutar ANALYZE despues de cada tabla
 #   --verbose                Mostrar mas detalle
 #   --help                   Mostrar esta ayuda
@@ -31,6 +35,8 @@ require "pg"
 require "optparse"
 require "time"
 
+$stdout.sync = true
+
 class MigrateDB
   STATE_TABLE = "public._migrate_db_state"
   UPDATED_AT_CANDIDATES = %w[updated_at modified_at last_updated fecha_actualizacion].freeze
@@ -43,6 +49,8 @@ class MigrateDB
       full: false,
       prune: false,
       analyze: true,
+      verify: true,
+      max_verify_rows: 5_000_000,
       verbose: false
     }
     parse_options!(argv)
@@ -51,7 +59,7 @@ class MigrateDB
     @source_schema = @options[:source_schema] || env_value("SCHEMA")
     @dest_schema = @options[:dest_schema] || @source_schema
     @source_data_timezone = ENV["SOURCE_DATA_TIMEZONE"] || ENV["TZ"] || "America/Mexico_City"
-    @only = @options[:only]
+    @only = @options[:only] || load_tables_file(@options[:tables_file] || default_tables_file)
     @exclude = @options[:exclude] || []
     @stage_counter = 0
     @stats = Hash.new(0)
@@ -63,6 +71,7 @@ class MigrateDB
   end
 
   def run
+    validate_table_selection!
     connect!
     prepare_destination!
     create_enums!
@@ -99,6 +108,8 @@ class MigrateDB
       opts.on("--source-schema NAME", "Schema origen") { |v| @options[:source_schema] = v }
       opts.on("--dest-schema NAME", "Schema destino") { |v| @options[:dest_schema] = v }
       opts.on("--only LISTA", "Tablas separadas por coma") { |v| @options[:only] = split_list(v) }
+      opts.on("--tables-file PATH", "Archivo con una tabla por linea") { |v| @options[:tables_file] = File.expand_path(v) }
+      opts.on("--all", "Migrar todas las tablas del schema") { @options[:all] = true }
       opts.on("--exclude LISTA", "Tablas a excluir separadas por coma") { |v| @options[:exclude] = split_list(v) }
       opts.on("--full", "Recargar por completo") { @options[:full] = true }
       opts.on("--prune", "Borrar filas que ya no existen en origen") { @options[:prune] = true }
@@ -106,6 +117,8 @@ class MigrateDB
       opts.on("--overlap-seconds N", Integer, "Solapamiento en segundos") { |v| @options[:overlap_seconds] = v }
       opts.on("--source-data-timezone NAME", "Zona horaria usada en los datos de origen") { |v| @options[:source_data_timezone] = v }
       opts.on("--no-analyze", "No ejecutar ANALYZE") { @options[:analyze] = false }
+      opts.on("--no-verify", "No comparar conteos para detectar filas nuevas") { @options[:verify] = false }
+      opts.on("--max-verify-rows N", Integer, "Maximo de filas estimadas para verificar") { |v| @options[:max_verify_rows] = v }
       opts.on("--verbose", "Mostrar detalle") { @options[:verbose] = true }
       opts.on("-h", "--help", "Mostrar ayuda") do
         puts opts
@@ -118,6 +131,25 @@ class MigrateDB
 
   def split_list(value)
     value.split(",").map(&:strip).reject(&:empty?)
+  end
+
+  def default_tables_file
+    File.expand_path("tables.txt", __dir__)
+  end
+
+  def load_tables_file(path)
+    return nil unless path && File.file?(path)
+
+    File.readlines(path, chomp: true).flat_map do |line|
+      line.sub(/#.*/, "").split(",")
+    end.map(&:strip).reject(&:empty?).uniq
+  end
+
+  def validate_table_selection!
+    return if @options[:all]
+    return if @only && !@only.empty?
+
+    raise "Indica las tablas a migrar con --only, --tables-file o usa --all"
   end
 
   def load_env(path)
@@ -245,7 +277,7 @@ class MigrateDB
     SQL
     if has_exclusion
       begin
-        @dest.exec("CREATE EXTENSION IF NOT EXISTS btree_gist")
+        @dest.exec("CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA public")
       rescue PG::Error => e
         warn "AVISO: no se pudo crear la extension btree_gist: #{e.message}"
       end
@@ -266,8 +298,8 @@ class MigrateDB
 
   def filter_tables(tables)
     names = tables.map { |t| t[:name] }
-    if @only
-      missing = @only - names
+    unless @options[:all]
+      missing = (@only || []) - names
       warn "AVISO: tablas no encontradas en origen: #{missing.join(', ')}" unless missing.empty?
       tables = tables.select { |t| @only.include?(t[:name]) }
     end
@@ -369,6 +401,10 @@ class MigrateDB
           action = "sincronizada"
         end
       end
+    end
+
+    if !@options[:schema_only] && @options[:verify] && action == "actualizada" && key
+      reconcile_new_rows!(table, source_cols, key, info)
     end
 
     analyze_table!(table) if @options[:analyze]
@@ -916,7 +952,13 @@ class MigrateDB
   end
 
   def normalize_definition(definition)
-    definition.to_s.sub(/\s+NOT VALID\z/i, "").strip
+    normalized = definition.to_s.sub(/\s+NOT VALID\z/i, "").strip
+    normalized = normalized.gsub(/"([a-z_][a-z0-9_]*)"/, '\1')
+    normalized = normalized.gsub(/\b(?:#{Regexp.escape(@source_schema)}|#{Regexp.escape(@dest_schema)})\./, "")
+    normalized = normalized.gsub(/\s+/, " ")
+    normalized = normalized.gsub(/\s*\(\s*/, "(")
+    normalized = normalized.gsub(/\s*\)\s*/, ")")
+    normalized.gsub(/\s*,\s*/, ", ").strip
   end
 
   def available_name(base, used)
@@ -1049,11 +1091,15 @@ class MigrateDB
         WHERE n.nspname = $1 AND c.relname = $2
       SQL
       normalized = normalize_definition(definition)
-      next if local_constraints.any? { |row| normalize_definition(row["definition"]) == normalized }
+      if local_constraints.any? { |row| normalize_definition(row["definition"]) == normalized }
+        puts "  FK existente: #{fk[:name]} (#{fk[:table_name]})" if @options[:verbose]
+        next
+      end
 
       local_names = local_constraints.map { |row| row["conname"] }.to_set
       name = available_name(fk[:name], local_names)
       begin
+        puts "  Creando FK: #{fk[:name]} (#{fk[:table_name]})" if @options[:verbose]
         @dest.exec(<<~SQL)
           ALTER TABLE ONLY #{dest_table(fk[:table_name])}
           ADD CONSTRAINT #{quote_ident(name)} #{definition} NOT VALID
@@ -1239,10 +1285,64 @@ class MigrateDB
     end
   end
 
+  def reconcile_new_rows!(table, columns, key, info)
+    estimated = info[:estimated_rows].to_i
+    return if estimated > @options[:max_verify_rows]
+
+    source_count = @source.exec("SELECT count(*) FROM #{src_table(table)}").getvalue(0, 0).to_i
+    local_count = @dest.exec("SELECT count(*) FROM #{dest_table(table)}").getvalue(0, 0).to_i
+    return if source_count <= local_count
+
+    key_select = key.each_with_index.map do |column, index|
+      "#{quote_ident(column)}::text AS #{quote_ident("k#{index}")}"
+    end.join(", ")
+    source_keys = @source.exec("SELECT #{key_select} FROM #{src_table(table)}").map do |row|
+      key.each_index.map { |index| row["k#{index}"] }
+    end
+    local_keys = @dest.exec("SELECT #{key_select} FROM #{dest_table(table)}").map do |row|
+      key.each_index.map { |index| row["k#{index}"] }
+    end
+    local_set = local_keys.map { |row| row.join("\u0001") }.to_set
+    missing = source_keys.reject { |row| local_set.include?(row.join("\u0001")) }
+    return if missing.empty?
+
+    if missing.size > 5_000
+      puts "\n  + #{missing.size} filas faltantes; recargando tabla completa"
+      merge_full!(table, columns, key, prune: false)
+    else
+      missing.each_slice(500) do |batch|
+        where_sql = key_condition(key, batch)
+        merge_rows!(table, columns, key, where_sql: where_sql, full_scan: false, prune: false)
+      end
+      puts "\n  + #{missing.size} filas nuevas recuperadas"
+    end
+  end
+
+  def key_condition(key, rows)
+    if key.length == 1
+      values = rows.map { |row| sql_literal(row[0]) }.join(", ")
+      return "#{quote_ident(key[0])} IN (#{values})"
+    end
+
+    columns = key.map { |column| quote_ident(column) }.join(", ")
+    values = rows.map do |row|
+      "(#{row.map { |value| sql_literal(value) }.join(", ")})"
+    end.join(", ")
+    "(#{columns}) IN (#{values})"
+  end
+
+  def sql_literal(value)
+    value.nil? ? "NULL" : @source.escape_literal(value)
+  end
+
   def analyze_table!(table)
-    @dest.exec("ANALYZE #{dest_table(table)}")
+    @dest.transaction do
+      @dest.exec("SET LOCAL lock_timeout = '30s'")
+      @dest.exec("SET LOCAL statement_timeout = '5min'")
+      @dest.exec("ANALYZE #{dest_table(table)}")
+    end
   rescue PG::Error => e
-    warn "AVISO: ANALYZE fallo en #{table}: #{e.message}"
+    warn "AVISO: ANALYZE omitido en #{table}: #{e.message}"
   end
 
   def print_summary
